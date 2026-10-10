@@ -5,18 +5,34 @@ const express = require('express');
 const chokidar = require('chokidar');
 
 // --- Pricing ---
+// USD per million tokens. Source: https://platform.claude.com/docs/en/about-claude/pricing (2026-10-10)
+// cacheWrite = 5-minute cache write rate; cacheRead = cache hit rate.
 const PRICING = {
-  'claude-opus-4-6':   { input: 15.00, output: 75.00 },
-  'claude-sonnet-4-6': { input: 3.00,  output: 15.00 },
-  'claude-haiku-4-5':  { input: 0.80,  output: 4.00 },
+  'claude-fable-5-1':  { input: 10.00, output: 50.00, cacheWrite: 12.50, cacheRead: 0.25 },
+  'claude-fable-5':    { input: 10.00, output: 50.00, cacheWrite: 12.50, cacheRead: 1.00 },
+  'claude-opus-5-5':   { input: 4.00,  output: 20.00, cacheWrite: 5.00,  cacheRead: 0.20 },
+  'claude-opus-5':     { input: 5.00,  output: 25.00, cacheWrite: 6.25,  cacheRead: 0.50 },
+  'claude-opus-4-8':   { input: 5.00,  output: 25.00, cacheWrite: 6.25,  cacheRead: 0.50 },
+  'claude-opus-4-7':   { input: 5.00,  output: 25.00, cacheWrite: 6.25,  cacheRead: 0.50 },
+  'claude-opus-4-6':   { input: 5.00,  output: 25.00, cacheWrite: 6.25,  cacheRead: 0.50 },
+  'claude-sonnet-5-5': { input: 2.00,  output: 10.00, cacheWrite: 2.50,  cacheRead: 0.10 },
+  'claude-sonnet-5':   { input: 2.00,  output: 10.00, cacheWrite: 2.50,  cacheRead: 0.20 },
+  'claude-sonnet-4-6': { input: 3.00,  output: 15.00, cacheWrite: 3.75,  cacheRead: 0.30 },
+  'claude-haiku-5-5':  { input: 0.10,  output: 0.50,  cacheWrite: 0.125, cacheRead: 0.01 },
+  'claude-haiku-4-5':  { input: 1.00,  output: 5.00,  cacheWrite: 1.25,  cacheRead: 0.10 },
 };
+const FREE = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+// Longest key first so 'claude-opus-5-5' wins over 'claude-opus-5'.
+const PRICING_KEYS = Object.keys(PRICING).sort((a, b) => b.length - a.length);
 
 function getPricing(model) {
-  if (!model) return PRICING['claude-sonnet-4-6'];
-  for (const [key, val] of Object.entries(PRICING)) {
-    if (model.includes(key)) return val;
+  if (!model) return PRICING['claude-opus-5-5'];
+  if (model === '<synthetic>') return FREE;
+  for (const key of PRICING_KEYS) {
+    if (model.startsWith(key)) return PRICING[key];
   }
-  return PRICING['claude-sonnet-4-6']; // fallback
+  console.warn(`Unknown model ${model}; using Opus 5.5 pricing`);
+  return PRICING['claude-opus-5-5'];
 }
 
 // --- Session State ---
@@ -140,8 +156,8 @@ function processEvent(event, projectHash) {
     session.costUSD =
       (session.tokensIn * pricing.input / 1_000_000) +
       (session.tokensOut * pricing.output / 1_000_000) +
-      (session.cacheCreationIn * pricing.input * 0.25 / 1_000_000) +
-      (session.cacheReadIn * pricing.input * 0.10 / 1_000_000);
+      (session.cacheCreationIn * pricing.cacheWrite / 1_000_000) +
+      (session.cacheReadIn * pricing.cacheRead / 1_000_000);
 
     // Log tool use
     if (Array.isArray(content)) {
@@ -329,14 +345,16 @@ app.get('/api/sessions', (req, res) => {
 });
 
 // --- Start ---
-const WATCH_DIR = path.join(os.homedir(), '.claude', 'projects');
-const PORT = 3001;
+// One or more Claude project dirs, colon-separated (e.g. a second account's CLAUDE_CONFIG_DIR).
+const WATCH_DIRS = (process.env.CLAUDE_PROJECT_DIRS || path.join(os.homedir(), '.claude', 'projects'))
+  .split(':').filter(Boolean);
+const PORT = Number(process.env.PORT) || 3001;
 
-console.log(`Watching: ${WATCH_DIR}`);
+console.log(`Watching: ${WATCH_DIRS.join(', ')}`);
 console.log(`Dashboard: http://localhost:${PORT}`);
 
 // Watch the projects directory (chokidar v5 needs directory, not glob)
-const watcher = chokidar.watch(WATCH_DIR, {
+const watcher = chokidar.watch(WATCH_DIRS, {
   persistent: true,
   ignoreInitial: false,
   depth: 4, // reach projects/hash/session/subagents/*.jsonl
