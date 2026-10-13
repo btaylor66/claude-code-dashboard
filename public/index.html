@@ -141,6 +141,8 @@
       letter-spacing: 0.3px;
     }
     .perm-badge.bypass { color: var(--red); background: rgba(255,68,68,0.15); }
+    .perm-badge.host { color: var(--blue); background: rgba(77,171,247,0.12); }
+    .perm-badge.account { color: var(--green); background: rgba(0,255,136,0.1); }
     .perm-badge.accept-edits { color: var(--yellow); background: rgba(255,204,0,0.12); }
 
     /* Subagents */
@@ -344,8 +346,8 @@
         e('div', { className: 'card-header' },
           e('div', null,
             e('div', { className: 'card-label',
-              style: session.cwd ? { cursor: 'pointer' } : {},
-              onClick: session.cwd ? (ev) => {
+              style: session.cwd && !session.remote ? { cursor: 'pointer' } : {},
+              onClick: session.cwd && !session.remote ? (ev) => {
                 fetch('/api/open-folder', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
@@ -366,6 +368,9 @@
             session.gitBranch ? e('div', { className: 'git-branch' }, session.gitBranch) : null
           ),
           e('div', { style: { display: 'flex', gap: '6px', alignItems: 'center' } },
+            session.host ? e('span', { className: 'perm-badge host' }, session.host) : null,
+            session.account && session.account !== 'default'
+              ? e('span', { className: 'perm-badge account' }, session.account) : null,
             session.permissionMode === 'bypassPermissions'
               ? e('span', { className: 'perm-badge bypass' }, 'YOLO')
               : session.permissionMode === 'acceptEdits'
@@ -510,7 +515,7 @@
               e('p', null, 'Start a Claude Code session in any terminal to see it here.')
             )
           : e('div', { className: 'grid' },
-              sessions.map(s => e(SessionCard, { key: s.sessionId, session: s }))
+              sessions.map(s => e(SessionCard, { key: s.key || s.sessionId, session: s }))
             )
       );
     }

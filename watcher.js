@@ -2,7 +2,18 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const express = require('express');
+const crypto = require('crypto');
 const chokidar = require('chokidar');
+
+// --- Identity / central-view settings ---
+// HOST labels where sessions run. Remote shippers send their own HOST.
+const HOST = (process.env.DASHBOARD_HOST || os.hostname()).slice(0, 64);
+// Shared secret for POST /api/ingest (server) and for shipping (client). Ingest is disabled without it.
+const TOKEN = process.env.DASHBOARD_TOKEN || '';
+// Shipper mode: `node watcher.js --ship http://server:3001` (or DASHBOARD_SHIP_URL).
+const shipArgIdx = process.argv.indexOf('--ship');
+const SHIP_URL = (shipArgIdx > -1 ? process.argv[shipArgIdx + 1] : process.env.DASHBOARD_SHIP_URL) || '';
+const SHIP_MAX_AGE_MS = (Number(process.env.SHIP_MAX_AGE_DAYS) || 7) * 86_400_000;
 
 // --- Pricing ---
 // USD per million tokens. Source: https://platform.claude.com/docs/en/about-claude/pricing (2026-10-10)
@@ -40,10 +51,13 @@ const sessions = new Map();
 const fileOffsets = new Map(); // path -> byte offset
 const seenMessageIds = new Map(); // sessionId -> Set of message.id
 
-function getOrCreateSession(sessionId) {
-  if (!sessions.has(sessionId)) {
-    sessions.set(sessionId, {
+function newSession(sessionId) {
+  return {
       sessionId,
+      key: '',
+      host: HOST,
+      account: '',
+      remote: false,
       projectHash: '',
       cwd: '',
       label: '',
@@ -66,10 +80,21 @@ function getOrCreateSession(sessionId) {
       permissionMode: '',
       version: '',
       subagents: {}, // agentId -> { task, status, tokensOut, lastEventAt }
-    });
-    seenMessageIds.set(sessionId, new Map()); // messageId -> {in, out, cacheCreate, cacheRead}
+  };
+}
+
+// Sessions are keyed by host + sessionId so the same id on two machines never collides.
+function getOrCreateSession(sessionId, ctx) {
+  const key = `${ctx.host}/${sessionId}`;
+  if (!sessions.has(key)) {
+    const s = newSession(sessionId);
+    s.key = key;
+    s.host = ctx.host;
+    s.account = ctx.account;
+    sessions.set(key, s);
+    seenMessageIds.set(key, new Map()); // messageId -> {in, out, cacheCreate, cacheRead}
   }
-  return sessions.get(sessionId);
+  return sessions.get(key);
 }
 
 function addToRecentLog(session, entry) {
@@ -93,11 +118,11 @@ function extractActiveFiles(content) {
   return files;
 }
 
-function processEvent(event, projectHash) {
+function processEvent(event, projectHash, ctx) {
   if (!event || !event.sessionId) return;
   if (event.type === 'file-history-snapshot' || event.type === 'queue-operation' || event.type === 'last-prompt') return;
 
-  const session = getOrCreateSession(event.sessionId);
+  const session = getOrCreateSession(event.sessionId, ctx);
   if (!event.timestamp) return; // skip events without timestamps
   const ts = event.timestamp;
 
@@ -127,7 +152,7 @@ function processEvent(event, projectHash) {
   if (event.type === 'assistant' && msg.usage) {
     const msgId = msg.id;
     const usage = msg.usage;
-    const seen = seenMessageIds.get(event.sessionId);
+    const seen = seenMessageIds.get(session.key);
 
     if (msg.model) session.model = msg.model;
 
@@ -253,6 +278,8 @@ function processFile(filePath) {
   if (stat.size <= offset) return;
 
   const projectHash = path.basename(path.dirname(filePath));
+  const root = ROOTS.find(r => filePath.startsWith(r.dir + path.sep));
+  const ctx = { host: HOST, account: root ? root.name : 'default' };
   const stream = fs.createReadStream(filePath, { start: offset, encoding: 'utf8' });
   let buffer = '';
 
@@ -264,7 +291,7 @@ function processFile(filePath) {
       if (!line.trim()) continue;
       try {
         const event = JSON.parse(line);
-        processEvent(event, projectHash);
+        processEvent(event, projectHash, ctx);
       } catch (e) {
         // Skip malformed lines (partial writes)
       }
@@ -314,14 +341,16 @@ app.get('/api/sessions', (req, res) => {
   const active = all.filter(s => s.status !== 'idle');
   const idle = all.filter(s => s.status === 'idle');
   // Collect labels that already have an active session
-  const activeLabels = new Set(active.map(s => s.label));
+  // Dedupe per host + account + project so machines/accounts never hide each other.
+  const groupKey = (s) => `${s.host}|${s.account}|${s.label}`;
+  const activeLabels = new Set(active.map(groupKey));
   const latestIdleByLabel = new Map();
   for (const s of idle) {
     // Skip idle sessions if that project already has an active session
-    if (activeLabels.has(s.label)) continue;
-    const existing = latestIdleByLabel.get(s.label);
+    if (activeLabels.has(groupKey(s))) continue;
+    const existing = latestIdleByLabel.get(groupKey(s));
     if (!existing || new Date(s.lastEventAt || 0) > new Date(existing.lastEventAt || 0)) {
-      latestIdleByLabel.set(s.label, s);
+      latestIdleByLabel.set(groupKey(s), s);
     }
   }
 
@@ -344,14 +373,94 @@ app.get('/api/sessions', (req, res) => {
   res.json(result);
 });
 
+// --- Central ingest: other machines POST their session state here ---
+function tokenOk(header) {
+  if (!TOKEN || typeof header !== 'string') return false;
+  const a = crypto.createHash('sha256').update(header).digest();
+  const b = crypto.createHash('sha256').update(TOKEN).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+// Copy only known fields of the expected type from an untrusted payload.
+function sanitizeRemote(raw, host, key) {
+  const base = newSession(String(raw.sessionId || '').slice(0, 128));
+  for (const k of Object.keys(base)) {
+    const v = raw[k];
+    if (v === undefined || v === null) continue;
+    if (Array.isArray(base[k])) { if (Array.isArray(v)) base[k] = v.slice(0, 30); }
+    else if (typeof v === typeof base[k]) base[k] = v;
+  }
+  if (typeof raw.lastEventAt === 'string') base.lastEventAt = raw.lastEventAt;
+  if (typeof raw.startedAt === 'string') base.startedAt = raw.startedAt;
+  base.host = host;
+  base.account = String(raw.account || 'default').slice(0, 64);
+  base.key = key;
+  base.remote = true;
+  return base;
+}
+
+app.post('/api/ingest', express.json({ limit: '5mb' }), (req, res) => {
+  if (!TOKEN) return res.status(403).json({ error: 'Ingest disabled: set DASHBOARD_TOKEN on the server' });
+  if (!tokenOk(req.get('x-dashboard-token'))) return res.status(401).json({ error: 'Bad token' });
+  const host = String((req.body && req.body.host) || '').slice(0, 64);
+  const list = req.body && req.body.sessions;
+  if (!host || !Array.isArray(list)) return res.status(400).json({ error: 'Need host and sessions[]' });
+  if (host === HOST) return res.status(400).json({ error: 'host collides with the server host; set DASHBOARD_HOST on the shipper' });
+  let n = 0;
+  for (const raw of list.slice(0, 500)) {
+    if (!raw || typeof raw.sessionId !== 'string' || !raw.sessionId) continue;
+    const key = `${host}/${raw.sessionId}`;
+    sessions.set(key, sanitizeRemote(raw, host, key));
+    n++;
+  }
+  res.json({ ok: true, accepted: n });
+});
+
+// --- Watch roots: explicit + auto-discovered Claude config dirs ---
+// CLAUDE_PROJECT_DIRS: colon-separated, each `path` or `name=path` (name = account label).
+// Auto-discovery (disable with CLAUDE_DISCOVER=0): ~/.claude*/projects and ~/.config/claude*/projects.
+const ROOTS = [];
+function accountNameFor(dir) {
+  const parent = path.basename(path.dirname(dir)).replace(/^\./, '');
+  const n = parent.replace(/^claude[-_]?/, '');
+  return n || 'default';
+}
+function addRoot(dir, name) {
+  dir = path.resolve(dir);
+  if (ROOTS.some(r => r.dir === dir)) return false;
+  ROOTS.push({ dir, name: name || accountNameFor(dir) });
+  return true;
+}
+function discoverRoots() {
+  if (process.env.CLAUDE_DISCOVER === '0') return [];
+  const found = [];
+  const home = os.homedir();
+  for (const base of [home, path.join(home, '.config')]) {
+    let entries = [];
+    try { entries = fs.readdirSync(base, { withFileTypes: true }); } catch { continue; }
+    for (const ent of entries) {
+      if (!ent.isDirectory() || !/^\.?claude/.test(ent.name)) continue;
+      const dir = path.join(base, ent.name, 'projects');
+      try { if (fs.statSync(dir).isDirectory()) found.push(dir); } catch {}
+    }
+  }
+  return found;
+}
+for (const entry of (process.env.CLAUDE_PROJECT_DIRS || '').split(':').filter(Boolean)) {
+  const eq = entry.indexOf('=');
+  if (eq > 0) addRoot(entry.slice(eq + 1), entry.slice(0, eq));
+  else addRoot(entry);
+}
+for (const d of discoverRoots()) addRoot(d);
+if (ROOTS.length === 0) addRoot(path.join(os.homedir(), '.claude', 'projects'));
+
 // --- Start ---
-// One or more Claude project dirs, colon-separated (e.g. a second account's CLAUDE_CONFIG_DIR).
-const WATCH_DIRS = (process.env.CLAUDE_PROJECT_DIRS || path.join(os.homedir(), '.claude', 'projects'))
-  .split(':').filter(Boolean);
+const WATCH_DIRS = ROOTS.map(r => r.dir);
 const PORT = Number(process.env.PORT) || 3001;
 
-console.log(`Watching: ${WATCH_DIRS.join(', ')}`);
-console.log(`Dashboard: http://localhost:${PORT}`);
+console.log(`Host: ${HOST}`);
+console.log(`Watching: ${ROOTS.map(r => `${r.name}=${r.dir}`).join(', ')}`);
+if (!SHIP_URL) console.log(`Dashboard: http://localhost:${PORT}`);
 
 // Watch the projects directory (chokidar v5 needs directory, not glob)
 const watcher = chokidar.watch(WATCH_DIRS, {
@@ -371,13 +480,60 @@ watcher.on('change', (filePath) => {
   if (shouldProcessFile(filePath)) processFile(filePath);
 });
 
-const server = app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`Port ${PORT} already in use. Kill the existing process or use a different port.`);
-    process.exit(1);
+// Pick up config dirs created after startup (e.g. a newly logged-in account).
+setInterval(() => {
+  for (const d of discoverRoots()) {
+    if (addRoot(d)) {
+      console.log(`Discovered: ${ROOTS[ROOTS.length - 1].name}=${d}`);
+      watcher.add(d);
+    }
   }
-  throw err;
-});
+}, 60_000).unref();
+
+if (SHIP_URL) {
+  // --- Shipper mode: no web server, push local session state to the central dashboard ---
+  if (!TOKEN) { console.error('Shipper needs DASHBOARD_TOKEN'); process.exit(1); }
+  const endpoint = SHIP_URL.replace(/\/+$/, '') + '/api/ingest';
+  const sent = new Map(); // key -> signature of last shipped state
+  const sig = (s) => `${s.lastEventAt}|${s.tokensIn}|${s.tokensOut}|${s.cacheReadIn}|${s.turnCount}|${s.model}`;
+  let busy = false;
+  setInterval(async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      const cutoff = Date.now() - SHIP_MAX_AGE_MS;
+      const dirty = [];
+      for (const s of sessions.values()) {
+        if (s.lastEventAt && new Date(s.lastEventAt).getTime() < cutoff) continue;
+        if (sent.get(s.key) !== sig(s)) dirty.push(s);
+      }
+      for (let i = 0; i < dirty.length; i += 50) {
+        const batch = dirty.slice(i, i + 50);
+        const r = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-dashboard-token': TOKEN },
+          body: JSON.stringify({ host: HOST, sessions: batch }),
+        });
+        if (!r.ok) { console.error(`Ship failed: HTTP ${r.status} ${await r.text()}`); break; }
+        for (const s of batch) sent.set(s.key, sig(s));
+      }
+    } catch (e) {
+      console.error(`Ship error: ${e.message}`);
+    } finally {
+      busy = false;
+    }
+  }, 2000);
+  console.log(`Shipping to ${endpoint} as host "${HOST}"`);
+} else {
+  const server = app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+    if (!TOKEN) console.log('Ingest disabled (set DASHBOARD_TOKEN to accept remote shippers)');
+  });
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`Port ${PORT} already in use. Kill the existing process or use a different port.`);
+      process.exit(1);
+    }
+    throw err;
+  });
+}
