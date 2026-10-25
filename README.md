@@ -63,6 +63,27 @@ The dashboard runs on port 3001 by default. To change it, set the `PORT` environ
 PORT=8080 npm start
 ```
 
+### Watching more than one machine or account
+
+`CLAUDE_PROJECT_DIRS` takes one or more Claude project directories, colon-separated.
+Each entry can carry a host label as `label=path`; a bare path is labelled with this
+machine's hostname. The label appears on every session card and in a per-host row under the
+header, which you can click to filter.
+
+```bash
+CLAUDE_PROJECT_DIRS="desktop=$HOME/.claude/projects:laptop=$HOME/claude-sessions/laptop/projects" npm start
+```
+
+To include another machine, mirror its `~/.claude/projects` with
+`scripts/sync-remote-sessions.sh` from cron. It stamps the destination with `.sync-ok` on
+success and `.sync-error` on failure, and the dashboard turns that into a freshness
+indicator per host (green under 3 minutes since the last sync, yellow under 15, red beyond
+that or when the sync is failing). Failures are also appended to `<dest>/../sync.log`.
+
+```bash
+* * * * * /path/to/scripts/sync-remote-sessions.sh me@laptop /home/me/claude-sessions/laptop/projects
+```
+
 ## Pricing
 
 Token costs are calculated using current Anthropic pricing. The pricing constants are in `watcher.js` — update them if pricing changes:

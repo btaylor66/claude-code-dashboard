@@ -72,6 +72,51 @@
     .stat-value { color: var(--text-bright); font-weight: 500; }
     .stat-value.cost { color: var(--green); }
 
+    /* --- Sources (per-host freshness) --- */
+    .sources {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: -8px 0 20px;
+      font-size: 12px;
+    }
+    .source {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      cursor: pointer;
+      color: var(--text);
+    }
+    .source:hover { background: var(--bg-card-hover); }
+    .source.selected { border-color: var(--blue); }
+    .source-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .source-dot.local { background: var(--blue); }
+    .source-dot.ok    { background: var(--green); }
+    .source-dot.stale { background: var(--yellow); }
+    .source-dot.down  { background: var(--red); animation: pulse 1.5s infinite; }
+    .source-label { color: var(--text-bright); font-weight: 500; }
+    .source-detail { color: var(--text-dim); }
+    .source-detail.down { color: var(--red); }
+    .source-detail.stale { color: var(--yellow); }
+
+    .host-badge {
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-weight: 500;
+      letter-spacing: 0.3px;
+      color: var(--blue);
+      background: rgba(77,171,247,0.12);
+    }
+
     /* --- Grid --- */
     .grid {
       display: grid;
@@ -366,6 +411,7 @@
             session.gitBranch ? e('div', { className: 'git-branch' }, session.gitBranch) : null
           ),
           e('div', { style: { display: 'flex', gap: '6px', alignItems: 'center' } },
+            session.host ? e('span', { className: 'host-badge', title: 'Host' }, session.host) : null,
             session.permissionMode === 'bypassPermissions'
               ? e('span', { className: 'perm-badge bypass' }, 'YOLO')
               : session.permissionMode === 'acceptEdits'
@@ -456,8 +502,43 @@
       );
     }
 
+    function sourceDetail(src) {
+      if (src.state === 'local') {
+        return 'local · last event ' + timeAgo(src.lastEventAt);
+      }
+      if (src.state === 'down') {
+        if (src.syncError) return 'sync failing since ' + timeAgo(src.syncError.at).replace(' ago', '');
+        if (!src.syncedAt) return 'never synced';
+        return 'last sync ' + timeAgo(src.syncedAt);
+      }
+      return 'synced ' + timeAgo(src.syncedAt);
+    }
+
+    function SourcesRow({ sources, sessions, hostFilter, onSelect }) {
+      if (!sources || sources.length < 1) return null;
+      return e('div', { className: 'sources' },
+        sources.map(src => {
+          const count = sessions.filter(s => s.host === src.label).length;
+          return e('div', {
+            key: src.label,
+            className: 'source' + (hostFilter === src.label ? ' selected' : ''),
+            title: (src.dir || '') + (src.syncError ? '\n' + src.syncError.message : '')
+              + '\nClick to filter sessions by host',
+            onClick: () => onSelect(hostFilter === src.label ? null : src.label),
+          },
+            e('span', { className: 'source-dot ' + src.state }),
+            e('span', { className: 'source-label' }, src.label),
+            e('span', { className: 'source-detail ' + src.state }, sourceDetail(src)),
+            e('span', { className: 'source-detail' }, count + ' sessions')
+          );
+        })
+      );
+    }
+
     function Dashboard() {
       const [sessions, setSessions] = useState([]);
+      const [sources, setSources] = useState([]);
+      const [hostFilter, setHostFilter] = useState(null);
       const [lastFetch, setLastFetch] = useState(null);
 
       const fetchSessions = useCallback(() => {
@@ -468,6 +549,10 @@
             setLastFetch(new Date());
           })
           .catch(() => {}); // silent on error
+        fetch('/api/sources')
+          .then(r => r.json())
+          .then(setSources)
+          .catch(() => {});
       }, []);
 
       useEffect(() => {
@@ -476,9 +561,10 @@
         return () => clearInterval(iv);
       }, [fetchSessions]);
 
-      const totalCost = sessions.reduce((s, x) => s + x.costUSD, 0);
-      const totalOut = sessions.reduce((s, x) => s + x.tokensOut, 0);
-      const activeSessions = sessions.filter(s => s.status === 'thinking' || s.status === 'waiting').length;
+      const shown = hostFilter ? sessions.filter(s => s.host === hostFilter) : sessions;
+      const totalCost = shown.reduce((s, x) => s + x.costUSD, 0);
+      const totalOut = shown.reduce((s, x) => s + x.tokensOut, 0);
+      const activeSessions = shown.filter(s => s.status === 'thinking' || s.status === 'waiting').length;
 
       return e('div', null,
         // Header
@@ -490,7 +576,7 @@
           e('div', { className: 'header-stats' },
             e('span', null,
               e('span', { className: 'stat-label' }, 'Sessions'),
-              e('span', { className: 'stat-value' }, activeSessions + '/' + sessions.length)
+              e('span', { className: 'stat-value' }, activeSessions + '/' + shown.length)
             ),
             e('span', null,
               e('span', { className: 'stat-label' }, 'Output'),
@@ -503,14 +589,19 @@
           )
         ),
 
+        // Per-host freshness row (click a host to filter)
+        e(SourcesRow, { sources, sessions, hostFilter, onSelect: setHostFilter }),
+
         // Cards
-        sessions.length === 0
+        shown.length === 0
           ? e('div', { className: 'empty' },
               e('h2', null, 'No sessions detected'),
-              e('p', null, 'Start a Claude Code session in any terminal to see it here.')
+              e('p', null, hostFilter
+                ? 'No sessions from ' + hostFilter + ' yet.'
+                : 'Start a Claude Code session in any terminal to see it here.')
             )
           : e('div', { className: 'grid' },
-              sessions.map(s => e(SessionCard, { key: s.sessionId, session: s }))
+              shown.map(s => e(SessionCard, { key: s.sessionId, session: s }))
             )
       );
     }

@@ -44,6 +44,7 @@ function getOrCreateSession(sessionId) {
   if (!sessions.has(sessionId)) {
     sessions.set(sessionId, {
       sessionId,
+      host: '',
       projectHash: '',
       cwd: '',
       label: '',
@@ -93,7 +94,7 @@ function extractActiveFiles(content) {
   return files;
 }
 
-function processEvent(event, projectHash) {
+function processEvent(event, projectHash, source) {
   if (!event || !event.sessionId) return;
   if (event.type === 'file-history-snapshot' || event.type === 'queue-operation' || event.type === 'last-prompt') return;
 
@@ -105,6 +106,10 @@ function processEvent(event, projectHash) {
   session.lastEventAt = ts;
   session.lastEventType = event.type;
   session.projectHash = projectHash;
+  if (source) {
+    session.host = source.label;
+    if (!source.lastEventAt || ts > source.lastEventAt) source.lastEventAt = ts;
+  }
 
   if (event.cwd && !session.cwd) {
     session.cwd = event.cwd;
@@ -253,6 +258,11 @@ function processFile(filePath) {
   if (stat.size <= offset) return;
 
   const projectHash = path.basename(path.dirname(filePath));
+  const source = sourceForFile(filePath);
+  if (source) {
+    const mtime = stat.mtime.toISOString();
+    if (!source.lastFileChangeAt || mtime > source.lastFileChangeAt) source.lastFileChangeAt = mtime;
+  }
   const stream = fs.createReadStream(filePath, { start: offset, encoding: 'utf8' });
   let buffer = '';
 
@@ -264,7 +274,7 @@ function processFile(filePath) {
       if (!line.trim()) continue;
       try {
         const event = JSON.parse(line);
-        processEvent(event, projectHash);
+        processEvent(event, projectHash, source);
       } catch (e) {
         // Skip malformed lines (partial writes)
       }
@@ -344,14 +354,96 @@ app.get('/api/sessions', (req, res) => {
   res.json(result);
 });
 
+// --- Sources ---
+// One or more Claude project dirs, colon-separated. Each entry is `label=path` or a bare
+// path (label defaults to this machine's hostname). The label is shown as the session's
+// host. A directory that is rsynced from another machine can carry two stamp files written
+// by scripts/sync-remote-sessions.sh: `.sync-ok` (mtime = last successful sync) and
+// `.sync-error` (text of the last failure, removed on the next success).
+const SYNC_OK_FILE = '.sync-ok';
+const SYNC_ERROR_FILE = '.sync-error';
+const SYNC_STALE_MS = 3 * 60_000;   // yellow after 3 minutes without a successful sync
+const SYNC_DOWN_MS = 15 * 60_000;   // red after 15 minutes
+
+function parseSources(spec) {
+  const entries = (spec || path.join(os.homedir(), '.claude', 'projects')).split(':').filter(Boolean);
+  return entries.map(entry => {
+    const eq = entry.indexOf('=');
+    const label = eq > 0 ? entry.slice(0, eq) : os.hostname();
+    const dir = path.resolve(eq > 0 ? entry.slice(eq + 1) : entry);
+    return {
+      label, dir,
+      lastEventAt: null,      // newest event timestamp parsed from this dir
+      lastFileChangeAt: null, // newest jsonl mtime seen in this dir
+      syncedAt: null,         // mtime of .sync-ok, remote sources only
+      syncError: null,        // { at, message } from .sync-error, if newer than .sync-ok
+      remote: false,
+    };
+  });
+}
+
+const SOURCES = parseSources(process.env.CLAUDE_PROJECT_DIRS);
+// Longest dir first so nested watch dirs resolve to the most specific source.
+const SOURCES_BY_DEPTH = SOURCES.slice().sort((a, b) => b.dir.length - a.dir.length);
+
+function sourceForFile(filePath) {
+  for (const src of SOURCES_BY_DEPTH) {
+    if (filePath === src.dir || filePath.startsWith(src.dir + path.sep)) return src;
+  }
+  return null;
+}
+
+function readSyncStamps() {
+  for (const src of SOURCES) {
+    let okStat = null;
+    try { okStat = fs.statSync(path.join(src.dir, SYNC_OK_FILE)); } catch {}
+    let errStat = null;
+    try { errStat = fs.statSync(path.join(src.dir, SYNC_ERROR_FILE)); } catch {}
+    src.remote = Boolean(okStat || errStat);
+    src.syncedAt = okStat ? okStat.mtime.toISOString() : null;
+    if (errStat && (!okStat || errStat.mtime > okStat.mtime)) {
+      let message = '';
+      try { message = fs.readFileSync(path.join(src.dir, SYNC_ERROR_FILE), 'utf8').trim().slice(0, 300); } catch {}
+      src.syncError = { at: errStat.mtime.toISOString(), message };
+    } else {
+      src.syncError = null;
+    }
+  }
+}
+
+// Freshness state for the UI: 'local' (watched directly), 'ok', 'stale', 'down'.
+function sourceState(src) {
+  if (!src.remote) return 'local';
+  if (src.syncError) return 'down';
+  if (!src.syncedAt) return 'down';
+  const age = Date.now() - new Date(src.syncedAt).getTime();
+  if (age < SYNC_STALE_MS) return 'ok';
+  if (age < SYNC_DOWN_MS) return 'stale';
+  return 'down';
+}
+
+app.get('/api/sources', (req, res) => {
+  res.json(SOURCES.map(src => ({
+    label: src.label,
+    dir: src.dir,
+    remote: src.remote,
+    state: sourceState(src),
+    syncedAt: src.syncedAt,
+    syncError: src.syncError,
+    lastEventAt: src.lastEventAt,
+    lastFileChangeAt: src.lastFileChangeAt,
+  })));
+});
+
 // --- Start ---
-// One or more Claude project dirs, colon-separated (e.g. a second account's CLAUDE_CONFIG_DIR).
-const WATCH_DIRS = (process.env.CLAUDE_PROJECT_DIRS || path.join(os.homedir(), '.claude', 'projects'))
-  .split(':').filter(Boolean);
+const WATCH_DIRS = SOURCES.map(s => s.dir);
 const PORT = Number(process.env.PORT) || 3001;
 
-console.log(`Watching: ${WATCH_DIRS.join(', ')}`);
+console.log(`Watching: ${SOURCES.map(s => `${s.label}=${s.dir}`).join(', ')}`);
 console.log(`Dashboard: http://localhost:${PORT}`);
+
+readSyncStamps();
+setInterval(readSyncStamps, 15_000);
 
 // Watch the projects directory (chokidar v5 needs directory, not glob)
 const watcher = chokidar.watch(WATCH_DIRS, {
