@@ -66,6 +66,9 @@ function getOrCreateSession(sessionId) {
       lastTurnInputTotal: 0, // input + cache for context window estimate
       permissionMode: '',
       version: '',
+      title: '',        // the name the person or the app gave it (`custom-title`)
+      remoteId: '',     // Remote Control's id (`bridge-session`): the session's address on claude.ai/code
+      entrypoint: '',   // cli, claude-desktop, sdk-cli (a script's headless run)
       subagents: {}, // agentId -> { task, status, tokensOut, lastEventAt }
     });
     seenMessageIds.set(sessionId, new Map()); // messageId -> {in, out, cacheCreate, cacheRead}
@@ -99,6 +102,9 @@ function processEvent(event, projectHash, source) {
   if (event.type === 'file-history-snapshot' || event.type === 'queue-operation' || event.type === 'last-prompt') return;
 
   const session = getOrCreateSession(event.sessionId);
+  // Bookkeeping lines carry no timestamp: the title and the Remote Control id are read before the skip below.
+  if (event.type === 'custom-title' && typeof event.customTitle === 'string') session.title = event.customTitle;
+  if (event.type === 'bridge-session' && typeof event.bridgeSessionId === 'string') session.remoteId = event.bridgeSessionId;
   if (!event.timestamp) return; // skip events without timestamps
   const ts = event.timestamp;
 
@@ -120,6 +126,7 @@ function processEvent(event, projectHash, source) {
     session.gitBranch = event.gitBranch;
   }
   if (event.version) session.version = event.version;
+  if (event.entrypoint && !session.entrypoint) session.entrypoint = event.entrypoint;
   if (event.permissionMode) session.permissionMode = event.permissionMode;
 
   const msg = event.message || {};
@@ -321,8 +328,13 @@ app.get('/api/sessions', (req, res) => {
 
   // Active sessions (thinking/waiting/error) always shown individually.
   // Idle sessions: only show the most recent per project label.
-  const active = all.filter(s => s.status !== 'idle');
-  const idle = all.filter(s => s.status === 'idle');
+  // `?recent=<days>` also keeps apart every session a person ran (not a script's `sdk-*` run) in that many days,
+  // so two conversations in one folder are two rows. Without it the page's own grouping is unchanged.
+  const recentMs = Math.min(Math.max(Number(req.query.recent) || 0, 0), 90) * 86_400_000;
+  const own = s => recentMs > 0 && !String(s.entrypoint).startsWith('sdk') && s.lastEventAt
+    && Date.now() - new Date(s.lastEventAt).getTime() < recentMs;
+  const active = all.filter(s => s.status !== 'idle' || own(s));
+  const idle = all.filter(s => s.status === 'idle' && !own(s));
   // Collect labels that already have an active session
   const activeLabels = new Set(active.map(s => s.label));
   const latestIdleByLabel = new Map();

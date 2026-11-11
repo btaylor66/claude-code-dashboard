@@ -74,6 +74,12 @@ header, which you can click to filter.
 CLAUDE_PROJECT_DIRS="desktop=$HOME/.claude/projects:laptop=$HOME/claude-sessions/laptop/projects" npm start
 ```
 
+Each session in `/api/sessions` also carries `title` (the name it was given), `remoteId`
+(Remote Control's `cse_...` id, when it ever had one) and `entrypoint` (`cli`,
+`claude-desktop`, `sdk-cli`). The page folds idle sessions into the latest per folder;
+`/api/sessions?recent=7` keeps every session a person ran in the last 7 days as its own row
+(headless `sdk-*` runs still fold).
+
 To include another machine, mirror its `~/.claude/projects` with
 `scripts/sync-remote-sessions.sh` from cron. It stamps the destination with `.sync-ok` on
 success and `.sync-error` on failure, and the dashboard turns that into a freshness
