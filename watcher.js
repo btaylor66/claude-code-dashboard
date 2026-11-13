@@ -434,6 +434,13 @@ function sourceState(src) {
   return 'down';
 }
 
+// Every session the watcher has read, with nothing folded: where each one ran. For joins by session id.
+app.get('/api/session-index', (req, res) => {
+  res.json([...sessions.values()].map(s => ({
+    sessionId: s.sessionId, host: s.host, cwd: s.cwd, entrypoint: s.entrypoint, lastEventAt: s.lastEventAt,
+  })));
+});
+
 app.get('/api/sources', (req, res) => {
   res.json(SOURCES.map(src => ({
     label: src.label,

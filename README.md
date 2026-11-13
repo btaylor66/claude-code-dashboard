@@ -78,7 +78,7 @@ Each session in `/api/sessions` also carries `title` (the name it was given), `r
 (Remote Control's `cse_...` id, when it ever had one) and `entrypoint` (`cli`,
 `claude-desktop`, `sdk-cli`). The page folds idle sessions into the latest per folder;
 `/api/sessions?recent=7` keeps every session a person ran in the last 7 days as its own row
-(headless `sdk-*` runs still fold).
+(headless `sdk-*` runs still fold). `/api/session-index` lists every session with the folder it ran in, nothing folded.
 
 To include another machine, mirror its `~/.claude/projects` with
 `scripts/sync-remote-sessions.sh` from cron. It stamps the destination with `.sync-ok` on
